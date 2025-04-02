@@ -5,6 +5,10 @@ import android.graphics.Color
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import kotlin.math.abs  // Add this import for the abs function
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
 
 private const val TAG = "ImageAnalyzer"
 
@@ -14,28 +18,27 @@ class PlayerImageAnalyzer(
 
     private var frameCount = 0
     
-    // Performance optimization
-    private val PROCESSING_INTERVAL = 3 // Process every 3rd frame for better responsiveness
-    
-    // Add new variables for sideline and horizon detection
-    private var framesSinceLastLineDetection = 0
+    // Line detection variables
     private var currentSidelineSlope = 0.0 // Slope of detected sideline
     private var currentSidelineIntercept = 0 // Y-intercept of detected sideline
     private var currentHorizonY = 0 // Y position of horizon line
-    private val LINE_DETECTION_INTERVAL = 60 // Increased interval for line detection (every 60 frames)
-    private val NUM_HORIZONTAL_SAMPLES = 8 // Number of horizontal sample points to check
-    private val NUM_VERTICAL_SAMPLES = 5 // Number of vertical samples for horizon detection
+    
+    // Detection intervals - using lower numbers for more frequent updates
+    private val SIDELINE_DETECTION_INTERVAL = 10 // Detect sideline every 10 frames
+    private val HORIZON_DETECTION_INTERVAL = 10 // Detect horizon every 10 frames
+    private val HORIZON_DETECTION_OFFSET = 5 // Offset detection to avoid running both at once
+    
+    // Updated sample count for sideline detection
+    private val NUM_HORIZONTAL_SAMPLES = 30 // Reduced to 30 scan lines
+    private val NUM_VERTICAL_SAMPLES = 5 // Sample points for horizon
     
     @androidx.camera.core.ExperimentalGetImage
     override fun analyze(imageProxy: ImageProxy) {
         val startTime = System.currentTimeMillis()
         
         try {
-            // Process only every Nth frame to improve performance
-            if (frameCount++ % PROCESSING_INTERVAL != 0) {
-                imageProxy.close()
-                return
-            }
+            // Process every frame
+            frameCount++
             
             Log.d(TAG, "Analyzing frame #$frameCount")
             val image = imageProxy.image
@@ -54,13 +57,19 @@ class PlayerImageAnalyzer(
             
             // Downsample the bitmap by 2x for better performance but still good detail
             val downsampledBitmap = downsampleBitmap(bitmap, 2)
-            Log.d(TAG, "Downsampled bitmap: ${downsampledBitmap.width}x${downsampledBitmap.height}")
             
-            // Create a binary debug bitmap with sideline detection
-            val debugBitmap = createFieldVisualizationWithSideline(downsampledBitmap)
+            // Decide if we need to detect lines in this frame
+            val detectSideline = frameCount % SIDELINE_DETECTION_INTERVAL == 0
+            val detectHorizon = frameCount % HORIZON_DETECTION_INTERVAL == HORIZON_DETECTION_OFFSET
+            
+            // Create a binary debug bitmap with sideline and horizon
+            val debugBitmap = createFieldVisualization(
+                downsampledBitmap, 
+                detectSideline, 
+                detectHorizon
+            )
             
             // Pass the debug bitmap to the callback - this is our main display now
-            Log.d(TAG, "Sending visualization bitmap: ${debugBitmap.width}x${debugBitmap.height}")
             onDebugImageProcessed(debugBitmap)
             
         } catch (e: Exception) {
@@ -93,24 +102,37 @@ class PlayerImageAnalyzer(
                (g * 0.7 > b * 0.8)
     }
     
-    private fun createFieldVisualizationWithSideline(original: Bitmap): Bitmap {
+    private fun createFieldVisualization(
+        original: Bitmap, 
+        detectSideline: Boolean, 
+        detectHorizon: Boolean
+    ): Bitmap {
         val width = original.width
         val height = original.height
         
         // Create a new bitmap 
         val debugBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         
-        // Detect sideline and horizon periodically to reduce computational cost
-        if (framesSinceLastLineDetection >= LINE_DETECTION_INTERVAL) {
-            detectSideline(original)
+        // Use a consistent order - detect horizon first, then sideline that starts from horizon
+        if (detectHorizon) {
             detectHorizon(original)
-            framesSinceLastLineDetection = 0
-        } else {
-            framesSinceLastLineDetection++
+            Log.d(TAG, "Horizon detection ran on frame $frameCount")
         }
         
-        // Get horizon position (default to 50% of height if not detected)
-        val horizonY = if (currentHorizonY > 0) currentHorizonY else height / 2
+        // Store sample points for visualization
+        val sampleColumns = mutableListOf<Int>()
+        val sampleEndPoints = mutableListOf<Pair<Int, Int>>()
+        
+        // Detect sideline after horizon, so it can use the horizon line
+        if (detectSideline) {
+            val sidelineResult = detectSideline(original)
+            sampleColumns.addAll(sidelineResult.first)
+            sampleEndPoints.addAll(sidelineResult.second)
+            Log.d(TAG, "Sideline detection ran on frame $frameCount")
+        }
+        
+        // Get horizon position (default to 1/3 of height if not detected)
+        val horizonY = if (currentHorizonY > 0) currentHorizonY else height / 3
         
         for (x in 0 until width) {
             // Calculate the y-position of the sideline at this x-position
@@ -153,6 +175,23 @@ class PlayerImageAnalyzer(
                 if (Math.abs(y - horizonY) < 2) {
                     debugBitmap.setPixel(x, y, Color.BLUE)
                 }
+                
+                // Draw vertical lines at each sample column showing scan direction (bottom to top)
+                if (x in sampleColumns) {
+                    // Find the endpoint for this column
+                    val endPoint = sampleEndPoints.find { it.first == x }?.second ?: (height * 2 / 3)
+                    
+                    // Draw yellow vertical line from bottom up to the detected sideline point
+                    if (y >= endPoint - 15 && y <= endPoint) {
+                        // Color the exact sideline point red for visibility
+                        if (y == endPoint) {
+                            debugBitmap.setPixel(x, y, Color.RED)
+                        } else {
+                            // Color the 15 pixels above it yellow to show the check area
+                            debugBitmap.setPixel(x, y, Color.YELLOW) 
+                        }
+                    }
+                }
             }
         }
         
@@ -160,84 +199,125 @@ class PlayerImageAnalyzer(
         return rotateBitmap(debugBitmap, 90f)
     }
     
-    private fun detectSideline(bitmap: Bitmap) {
+    private fun detectSideline(bitmap: Bitmap): Pair<List<Int>, List<Pair<Int, Int>>> {
         val width = bitmap.width
         val height = bitmap.height
-        val halfHeight = height / 2
         
-        // This will hold the top-most non-green pixels (potential players) at sample points
+        // This will hold the sideline points (where we transition from field to non-field)
         val samplePoints = mutableListOf<Pair<Int, Int>>()
         
         // Sample at evenly spaced horizontal intervals
         val sampleSpacing = width / (NUM_HORIZONTAL_SAMPLES + 1)
         
-        // For each sample point, scan from the middle down to find first significant non-green blob
+        // Store columns and endpoints for visualization
+        val sampleColumns = mutableListOf<Int>()
+        val sampleEndpoints = mutableListOf<Pair<Int, Int>>()
+        
+        // For each sample column, scan from bottom up to find the sideline
         for (sampleIndex in 1..NUM_HORIZONTAL_SAMPLES) {
             val x = sampleIndex * sampleSpacing
+            sampleColumns.add(x) // Add this column for visualization
             
-            // Start at the middle of the image and scan toward the bottom
-            // Looking for clusters of non-green pixels (potential players)
-            var blobFound = false
-            var consecutiveNonGreen = 0
-            var topOfBlob = halfHeight
+            var sidelineY = height * 2 / 3 // Default position if no sideline found
+            var foundSideline = false
             
-            for (y in halfHeight until height) {
+            // Scan from bottom up to find the last black pixel with 15 consecutive white pixels above it
+            for (y in height - 1 downTo height / 4) {
                 val pixel = bitmap.getPixel(x, y)
                 
+                // Check if current pixel is non-green (black in our visualization)
                 if (!isGreen(pixel)) {
-                    consecutiveNonGreen++
+                    // Check if there are 15 consecutive green (white) pixels above this point
+                    var consecutiveGreenCount = 0
+                    var allGreen = true
                     
-                    // Consider a significant blob when we find several consecutive non-green pixels
-                    if (consecutiveNonGreen > 5 && !blobFound) {
-                        topOfBlob = y - 5 // Adjust to get the top of the blob
-                        blobFound = true
+                    // Look at the 15 pixels above this point
+                    for (checkY in y - 1 downTo y - 15) {
+                        // Make sure we don't go off the top of the image
+                        if (checkY < 0) {
+                            allGreen = false
+                            break
+                        }
+                        
+                        // Check if pixel is green
+                        if (isGreen(bitmap.getPixel(x, checkY))) {
+                            consecutiveGreenCount++
+                        } else {
+                            allGreen = false
+                            break
+                        }
+                    }
+                    
+                    // If we found 15 consecutive green pixels above this black pixel, we found the sideline
+                    if (consecutiveGreenCount >= 15 && allGreen) {
+                        sidelineY = y
+                        foundSideline = true
                         break
                     }
-                } else {
-                    consecutiveNonGreen = 0
                 }
             }
             
-            if (blobFound) {
-                samplePoints.add(Pair(x, topOfBlob))
+            // Add the found sideline point to our collections
+            if (foundSideline) {
+                samplePoints.add(Pair(x, sidelineY))
             }
+            
+            // Always add an endpoint for visualization
+            sampleEndpoints.add(Pair(x, sidelineY))
         }
         
         // If we found enough points, fit a line using linear regression
         if (samplePoints.size >= 3) {
-            // Simple linear regression to find the best-fit line
-            // y = mx + b
+            // Remove any outliers to improve line fit
+            val yValues = samplePoints.map { it.second }
+            val median = calculateMedian(yValues)
+            val mad = calculateMAD(yValues, median)
             
-            // Calculate the means
-            val n = samplePoints.size
-            val sumX = samplePoints.sumOf { it.first.toDouble() }
-            val sumY = samplePoints.sumOf { it.second.toDouble() }
-            val meanX = sumX / n
-            val meanY = sumY / n
-            
-            // Calculate slope (m) using a simplified least squares method
-            var numerator = 0.0
-            var denominator = 0.0
-            
-            for (point in samplePoints) {
-                val xDiff = point.first - meanX
-                val yDiff = point.second - meanY
-                numerator += xDiff * yDiff
-                denominator += xDiff * xDiff
+            // Filter out points that are too far from the median
+            val filteredPoints = samplePoints.filter { 
+                abs(it.second - median) < 2.5 * mad 
             }
             
-            // Avoid division by zero
-            if (denominator != 0.0) {
-                val slope = numerator / denominator
-                val intercept = meanY - slope * meanX
+            if (filteredPoints.size >= 3) {
+                // Simple linear regression to find the best-fit line (y = mx + b)
+                // Calculate the means
+                val n = filteredPoints.size
+                val sumX = filteredPoints.sumOf { it.first.toDouble() }
+                val sumY = filteredPoints.sumOf { it.second.toDouble() }
+                val meanX = sumX / n
+                val meanY = sumY / n
                 
-                // Update the current sideline equation
-                currentSidelineSlope = slope
-                currentSidelineIntercept = intercept.toInt()
+                // Calculate slope (m) using a simplified least squares method
+                var numerator = 0.0
+                var denominator = 0.0
                 
-                Log.d(TAG, "Detected sideline: y = ${currentSidelineSlope}x + $currentSidelineIntercept")
+                for (point in filteredPoints) {
+                    val xDiff = point.first - meanX
+                    val yDiff = point.second - meanY
+                    numerator += xDiff * yDiff
+                    denominator += xDiff * xDiff
+                }
+                
+                // Avoid division by zero
+                if (denominator != 0.0) {
+                    val slope = numerator / denominator
+                    
+                    // Limit the slope to a reasonable range to prevent extreme angles
+                    val limitedSlope = slope.coerceIn(-0.5, 0.5)
+                    
+                    val intercept = meanY - limitedSlope * meanX
+                    
+                    // Update the current sideline equation
+                    currentSidelineSlope = limitedSlope
+                    currentSidelineIntercept = intercept.toInt()
+                    
+                    Log.d(TAG, "Detected sideline: y = ${currentSidelineSlope}x + $currentSidelineIntercept with ${filteredPoints.size} points")
+                }
             }
         }
+        
+        // Return the columns and endpoints for visualization
+        return Pair(sampleColumns, sampleEndpoints)
     }
     
     private fun detectHorizon(bitmap: Bitmap) {
@@ -307,8 +387,26 @@ class PlayerImageAnalyzer(
         // Calculate y position using the line equation: y = mx + b
         val y = (currentSidelineSlope * x + currentSidelineIntercept).toInt()
         
-        // Constrain to reasonable values (between 1/2 and 3/4 of height)
-        return y.coerceIn(height / 2, (height * 3) / 4)
+        // Constrain to reasonable values (between 1/3 and 3/4 of height)
+        // Expanded the range to allow for more angled sidelines
+        return y.coerceIn(height / 3, (height * 3) / 4)
+    }
+    
+    // Helper function to calculate median
+    private fun calculateMedian(values: List<Number>): Double {
+        val sortedValues = values.map { it.toDouble() }.sorted()
+        val mid = sortedValues.size / 2
+        return if (sortedValues.size % 2 == 0) {
+            (sortedValues[mid - 1] + sortedValues[mid]) / 2.0
+        } else {
+            sortedValues[mid]
+        }
+    }
+
+    // Helper function to calculate Median Absolute Deviation (robust measure of variability)
+    private fun calculateMAD(values: List<Int>, median: Double): Double {
+        val deviations = values.map { abs(it - median) }
+        return calculateMedian(deviations)
     }
     
     @androidx.camera.core.ExperimentalGetImage
@@ -332,7 +430,6 @@ class PlayerImageAnalyzer(
         return bitmap
     }
     
-    // Add a function to rotate the bitmap
     private fun rotateBitmap(source: Bitmap, degrees: Float): Bitmap {
         val matrix = android.graphics.Matrix()
         matrix.postRotate(degrees)
