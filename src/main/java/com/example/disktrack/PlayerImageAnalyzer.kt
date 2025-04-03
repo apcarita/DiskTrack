@@ -176,19 +176,19 @@ class PlayerImageAnalyzer(
                     debugBitmap.setPixel(x, y, Color.BLUE)
                 }
                 
-                // Draw vertical lines at each sample column showing scan direction (bottom to top)
+                // Draw vertical lines at each sample column showing detection area
                 if (x in sampleColumns) {
                     // Find the endpoint for this column
-                    val endPoint = sampleEndPoints.find { it.first == x }?.second ?: (height * 2 / 3)
+                    val sidelineY = sampleEndPoints.find { it.first == x }?.second ?: (height * 2 / 3)
                     
-                    // Draw yellow vertical line from bottom up to the detected sideline point
-                    if (y >= endPoint - 15 && y <= endPoint) {
-                        // Color the exact sideline point red for visibility
-                        if (y == endPoint) {
-                            debugBitmap.setPixel(x, y, Color.RED)
+                    // Draw a short magenta segment showing the detected transition point
+                    val segmentSize = 10
+                    if (y >= sidelineY - segmentSize && y <= sidelineY + segmentSize) {
+                        // Use different colors for above and below to show the transition
+                        if (y < sidelineY) {
+                            debugBitmap.setPixel(x, y, Color.YELLOW) // Above transition
                         } else {
-                            // Color the 15 pixels above it yellow to show the check area
-                            debugBitmap.setPixel(x, y, Color.YELLOW) 
+                            debugBitmap.setPixel(x, y, Color.MAGENTA) // Below transition
                         }
                     }
                 }
@@ -203,7 +203,7 @@ class PlayerImageAnalyzer(
         val width = bitmap.width
         val height = bitmap.height
         
-        // This will hold the sideline points (where we transition from field to non-field)
+        // This will hold the sideline points 
         val samplePoints = mutableListOf<Pair<Int, Int>>()
         
         // Sample at evenly spaced horizontal intervals
@@ -213,57 +213,58 @@ class PlayerImageAnalyzer(
         val sampleColumns = mutableListOf<Int>()
         val sampleEndpoints = mutableListOf<Pair<Int, Int>>()
         
-        // For each sample column, scan from bottom up to find the sideline
+        // For each sample column
         for (sampleIndex in 1..NUM_HORIZONTAL_SAMPLES) {
             val x = sampleIndex * sampleSpacing
             sampleColumns.add(x) // Add this column for visualization
             
-            var sidelineY = height * 2 / 3 // Default position if no sideline found
-            var foundSideline = false
+            // Start scan at around 2/3 down the image - most likely sideline area
+            val scanStartY = height * 2 / 3
             
-            // Scan from bottom up to find the last black pixel with 15 consecutive white pixels above it
-            for (y in height - 1 downTo height / 4) {
-                val pixel = bitmap.getPixel(x, y)
+            // Scan upward and downward to find the best sideline point
+            var bestY = scanStartY
+            var maxTransitionStrength = 0
+            
+            // Search in a reasonable range around the expected sideline position
+            val searchRange = height / 6
+            val startSearch = scanStartY - searchRange
+            val endSearch = scanStartY + searchRange
+            
+            // Find the strongest green/non-green transition
+            for (y in startSearch until endSearch) {
+                if (y <= 0 || y >= height - 10) continue // Stay within image bounds
                 
-                // Check if current pixel is non-green (black in our visualization)
-                if (!isGreen(pixel)) {
-                    // Check if there are 15 consecutive green (white) pixels above this point
-                    var consecutiveGreenCount = 0
-                    var allGreen = true
-                    
-                    // Look at the 15 pixels above this point
-                    for (checkY in y - 1 downTo y - 15) {
-                        // Make sure we don't go off the top of the image
-                        if (checkY < 0) {
-                            allGreen = false
-                            break
-                        }
-                        
-                        // Check if pixel is green
-                        if (isGreen(bitmap.getPixel(x, checkY))) {
-                            consecutiveGreenCount++
-                        } else {
-                            allGreen = false
-                            break
-                        }
-                    }
-                    
-                    // If we found 15 consecutive green pixels above this black pixel, we found the sideline
-                    if (consecutiveGreenCount >= 15 && allGreen) {
-                        sidelineY = y
-                        foundSideline = true
-                        break
-                    }
+                // Count green pixels in small segments above and below this point
+                val segmentSize = 10
+                var greenAbove = 0
+                var greenBelow = 0
+                
+                // Check above
+                for (checkY in (y - segmentSize) until y) {
+                    if (checkY < 0) continue
+                    if (isGreen(bitmap.getPixel(x, checkY))) greenAbove++
+                }
+                
+                // Check below
+                for (checkY in y until (y + segmentSize)) {
+                    if (checkY >= height) break
+                    if (isGreen(bitmap.getPixel(x, checkY))) greenBelow++
+                }
+                
+                // Calculate transition strength - we want many green pixels below and few above
+                // (or vice versa) to indicate a boundary
+                val transitionStrength = greenBelow - greenAbove
+                
+                // We're looking for a strong field-to-sideline transition
+                if (transitionStrength > maxTransitionStrength) {
+                    maxTransitionStrength = transitionStrength
+                    bestY = y
                 }
             }
             
-            // Add the found sideline point to our collections
-            if (foundSideline) {
-                samplePoints.add(Pair(x, sidelineY))
-            }
-            
-            // Always add an endpoint for visualization
-            sampleEndpoints.add(Pair(x, sidelineY))
+            // Save the detected point
+            samplePoints.add(Pair(x, bestY))
+            sampleEndpoints.add(Pair(x, bestY))
         }
         
         // If we found enough points, fit a line using linear regression
@@ -275,11 +276,11 @@ class PlayerImageAnalyzer(
             
             // Filter out points that are too far from the median
             val filteredPoints = samplePoints.filter { 
-                abs(it.second - median) < 2.5 * mad 
+                abs(it.second - median) < 2.0 * mad 
             }
             
             if (filteredPoints.size >= 3) {
-                // Simple linear regression to find the best-fit line (y = mx + b)
+                // Simple linear regression to find the best-fit line
                 // Calculate the means
                 val n = filteredPoints.size
                 val sumX = filteredPoints.sumOf { it.first.toDouble() }
@@ -303,7 +304,7 @@ class PlayerImageAnalyzer(
                     val slope = numerator / denominator
                     
                     // Limit the slope to a reasonable range to prevent extreme angles
-                    val limitedSlope = slope.coerceIn(-0.5, 0.5)
+                    val limitedSlope = slope.coerceIn(-0.3, 0.3)
                     
                     val intercept = meanY - limitedSlope * meanX
                     

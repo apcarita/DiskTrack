@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
@@ -52,11 +53,18 @@ fun CameraPreviewContent(modifier: Modifier = Modifier, viewModel: CameraViewMod
     var hasError by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
     
-    // Create analyzer that only produces the field visualization
-    val imageAnalyzer = remember { 
-        PlayerImageAnalyzer { bitmap ->
-            Log.d(TAG, "Received new bitmap from analyzer: ${bitmap.width}x${bitmap.height}")
+    // Create ML Kit image analyzer
+    val mlImageAnalyzer = remember { 
+        MLImageAnalyzer { bitmap ->
+            Log.d(TAG, "Received processed image: ${bitmap.width}x${bitmap.height}")
             fieldBitmap = bitmap
+        }
+    }
+    
+    // Clean up resources when the composable is disposed
+    DisposableEffect(Unit) {
+        onDispose {
+            mlImageAnalyzer.release()
         }
     }
     
@@ -97,15 +105,19 @@ fun CameraPreviewContent(modifier: Modifier = Modifier, viewModel: CameraViewMod
             cameraProvider.unbindAll()
             
             // Create preview use case
-            val preview = Preview.Builder().build()
+            val preview = Preview.Builder()
+                .setTargetRotation(android.view.Surface.ROTATION_90) // Fix rotation
+                .build()
             preview.setSurfaceProvider(previewView.surfaceProvider)
             
-            // Setup image analysis
+            // Setup ML Kit image analysis
             val imageAnalysisBuilder = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .setTargetRotation(android.view.Surface.ROTATION_90) // Fix rotation
                 
             val imageAnalysisUseCase = imageAnalysisBuilder.build()
-            imageAnalysisUseCase.setAnalyzer(ContextCompat.getMainExecutor(context), imageAnalyzer)
+            imageAnalysisUseCase.setAnalyzer(ContextCompat.getMainExecutor(context), mlImageAnalyzer)
             
             // Use the back camera
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
@@ -118,7 +130,7 @@ fun CameraPreviewContent(modifier: Modifier = Modifier, viewModel: CameraViewMod
                 imageAnalysisUseCase
             )
             
-            Log.d(TAG, "Camera setup complete with exposure mode: ${camera.cameraInfo.exposureState}")
+            Log.d(TAG, "Camera setup complete")
             debugState = "Camera ready"
             
         } catch (e: Exception) {
@@ -140,7 +152,7 @@ fun CameraPreviewContent(modifier: Modifier = Modifier, viewModel: CameraViewMod
                 .background(Color.Transparent)
         )
         
-        // Show field visualization as main content
+        // Show field visualization as main content (don't rotate here since we're fixing it in the analyzer)
         fieldBitmap?.let { bitmap ->
             Image(
                 bitmap = bitmap.asImageBitmap(),

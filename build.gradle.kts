@@ -68,7 +68,6 @@ dependencies {
     // Add ML Kit Vision if you want to expand player detection capabilities
     implementation("com.google.mlkit:image-labeling:17.0.7")
     implementation("com.google.mlkit:object-detection:17.0.0")
-    
     // Optional: OpenCV for more advanced image processing
     // implementation("org.opencv:opencv:4.7.0")
 }
