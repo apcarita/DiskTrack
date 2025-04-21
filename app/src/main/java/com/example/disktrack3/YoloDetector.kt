@@ -15,7 +15,7 @@ import org.opencv.core.Size
 import org.opencv.dnn.Dnn
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
-import org.tensorflow.lite.InterpreterApi
+import org.tensorflow.lite.Interpreter
 
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -29,16 +29,19 @@ import kotlin.math.min
 
 class YoloDetector(
     context: Context,
-    options: InterpreterApi.Options
+    options: Interpreter.Options
 ) {
 
     private val TAG = "YoloDetector"
     private val TFLITE_MODEL_FILE = "yolo11n.tflite" // Your model file in assets
+    // *** Optimization Note: Consider reducing input size if model supports it ***
+    // Smaller sizes like 320 or 416 significantly reduce computation.
+    // Check model documentation or try experimentally.
     private val YOLO_INPUT_SIZE = 640 // Input size expected by your YOLO model
     private val YOLO_CONFIDENCE_THRESHOLD = 0.25f // Restore a reasonable threshold
     private val YOLO_IOU_THRESHOLD = 0.45f // Threshold for Non-Max Suppression
 
-    private var tfliteInterpreter: InterpreterApi? = null
+    private var tfliteInterpreter: Interpreter? = null
     private val isInitialized = AtomicBoolean(false)
     private var inputByteBuffer: ByteBuffer? = null
     private var outputBuffer: Array<Array<FloatArray>>? = null
@@ -59,14 +62,22 @@ class YoloDetector(
     private val ACTUAL_EXPECTED_NUM_CLASSES = 80
     private val OUTPUT_NUM_PARAMS = 84 // 4 (bbox) + 80 (classes)
     private val OUTPUT_NUM_PREDICTIONS = 8400
+    private val PERSON_CLASS_INDEX: Int = cocoLabels.indexOf("person")
 
     init {
+        Log.d(TAG, "YoloDetector init: Starting initialization (standalone)...")
+        if (PERSON_CLASS_INDEX == -1) {
+            Log.e(TAG, "Initialization Error: Could not find 'person' class in cocoLabels!")
+        } else {
+            Log.d(TAG, "'person' class index: $PERSON_CLASS_INDEX")
+        }
+
         try {
             val assetManager = context.assets
             val modelBuffer = loadModelFile(assetManager, TFLITE_MODEL_FILE)
 
-            // Initialize InterpreterApi using the provided options and factory method
-            tfliteInterpreter = InterpreterApi.create(modelBuffer, options) // Use factory method
+            // Initialize standalone Interpreter directly using LiteRT implementation
+            tfliteInterpreter = Interpreter(modelBuffer, options)
 
             val bufferSize = 1 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3 * 4
             Log.d(TAG, "Allocating input buffer size: $bufferSize bytes for ${YOLO_INPUT_SIZE}x${YOLO_INPUT_SIZE}")
@@ -96,12 +107,13 @@ class YoloDetector(
             classNames = cocoLabels
 
             isInitialized.set(true)
-            Log.d(TAG, "YoloDetector initialized successfully")
+            Log.d(TAG, "YoloDetector initialized successfully (standalone)")
         } catch (e: Exception) {
-            Log.e(TAG, "Error initializing YoloDetector: ${e.message}", e)
-            // InterpreterApi handles delegate closure internally on error or close()
+            Log.e(TAG, "Error initializing YoloDetector (standalone): ${e.message}", e)
+            // Interpreter handles delegate closure internally on error or close()
             isInitialized.set(false)
         }
+        Log.d(TAG, "YoloDetector init: Initialization block finished (standalone).")
     }
 
     fun isReady(): Boolean = isInitialized.get()
@@ -120,7 +132,7 @@ class YoloDetector(
 
     fun detect(bitmap: Bitmap, frameWidth: Int, frameHeight: Int): List<Detection> {
         if (!isInitialized.get() || tfliteInterpreter == null || inputByteBuffer == null || outputBuffer == null) {
-            Log.w(TAG, "Detector not initialized or buffers are null.")
+            Log.w(TAG, "Detector not initialized or buffers are null (standalone).")
             return emptyList()
         }
 
@@ -146,13 +158,11 @@ class YoloDetector(
         try {
             tfliteInterpreter?.run(inputByteBuffer, outputBuffer)
         } catch (e: Exception) {
-            Log.e(TAG, "TFLite inference error: ${e.message}", e)
+            Log.e(TAG, "TFLite inference error (standalone): ${e.message}", e)
             return emptyList()
         }
 
-        val allDetections = processOutput(outputBuffer!!, frameWidth, frameHeight)
-        val personDetections = allDetections.filter { it.className.equals("person", ignoreCase = true) }
-        return personDetections
+        return processOutput(outputBuffer!!, frameWidth, frameHeight)
     }
 
     private fun processOutput(output: Array<Array<FloatArray>>, frameWidth: Int, frameHeight: Int): List<Detection> {
@@ -160,65 +170,54 @@ class YoloDetector(
         val NUM_PARAMS = OUTPUT_NUM_PARAMS
         val NUM_CLASSES = NUM_PARAMS - 4
 
-        val detections = mutableListOf<Detection>()
-        val boundingBoxes = mutableListOf<Rect2d>()
-        val confidences = mutableListOf<Float>()
-        val classIndexes = mutableListOf<Int>()
+        val personBoxes = mutableListOf<Rect2d>()
+        val personConfidences = mutableListOf<Float>()
 
         for (i in 0 until NUM_PREDICTIONS) {
-            var currentMaxClassScore = 0f
-
-            val centerX = output[0][0][i]
-            val centerY = output[0][1][i]
-            val width = output[0][2][i]
-            val height = output[0][3][i]
-
             var maxClassScore = 0f
             var classIndex = -1
             for (j in 0 until NUM_CLASSES) {
                 val classScore = output[0][4 + j][i]
-                if (classScore > currentMaxClassScore) {
-                    currentMaxClassScore = classScore
+                if (classScore > maxClassScore) {
+                    maxClassScore = classScore
                     classIndex = j
                 }
             }
-            maxClassScore = currentMaxClassScore
 
-            val finalConfidence = maxClassScore
+            if (classIndex == PERSON_CLASS_INDEX && maxClassScore >= YOLO_CONFIDENCE_THRESHOLD) {
+                val centerX = output[0][0][i]
+                val centerY = output[0][1][i]
+                val width = output[0][2][i]
+                val height = output[0][3][i]
 
-            if (finalConfidence >= YOLO_CONFIDENCE_THRESHOLD) {
-                if (classIndex != -1) {
-                    val scaleX = frameWidth.toDouble() / YOLO_INPUT_SIZE
-                    val scaleY = frameHeight.toDouble() / YOLO_INPUT_SIZE
+                val scaleX = frameWidth.toDouble() / YOLO_INPUT_SIZE
+                val scaleY = frameHeight.toDouble() / YOLO_INPUT_SIZE
+                val scaledCenterX = centerX * scaleX
+                val scaledCenterY = centerY * scaleY
+                val scaledWidth = width * scaleX
+                val scaledHeight = height * scaleY
+                val x1 = max(0.0, (scaledCenterX - scaledWidth / 2.0))
+                val y1 = max(0.0, (scaledCenterY - scaledHeight / 2.0))
+                val x2 = min(frameWidth.toDouble() - 1, (scaledCenterX + scaledWidth / 2.0))
+                val y2 = min(frameHeight.toDouble() - 1, (scaledCenterY + scaledHeight / 2.0))
+                val rectWidth = max(0.0, x2 - x1)
+                val rectHeight = max(0.0, y2 - y1)
 
-                    val scaledCenterX = centerX * scaleX
-                    val scaledCenterY = centerY * scaleY
-                    val scaledWidth = width * scaleX
-                    val scaledHeight = height * scaleY
-
-                    val x1 = max(0.0, (scaledCenterX - scaledWidth / 2.0))
-                    val y1 = max(0.0, (scaledCenterY - scaledHeight / 2.0))
-                    val x2 = min(frameWidth.toDouble() - 1, (scaledCenterX + scaledWidth / 2.0))
-                    val y2 = min(frameHeight.toDouble() - 1, (scaledCenterY + scaledHeight / 2.0))
-
-                    val rectWidth = max(0.0, x2 - x1)
-                    val rectHeight = max(0.0, y2 - y1)
-
-                    if (rectWidth > 0 && rectHeight > 0) {
-                        boundingBoxes.add(Rect2d(x1, y1, rectWidth, rectHeight))
-                        confidences.add(finalConfidence)
-                        classIndexes.add(classIndex)
-                    }
+                if (rectWidth > 0 && rectHeight > 0) {
+                    personBoxes.add(Rect2d(x1, y1, rectWidth, rectHeight))
+                    personConfidences.add(maxClassScore)
                 }
             }
         }
 
-        if (boundingBoxes.isEmpty()) {
+        if (personBoxes.isEmpty()) {
+            Log.d(TAG, "No potential person detections found before NMS.")
             return emptyList()
         }
+        Log.d(TAG, "Found ${personBoxes.size} potential person detections before NMS.")
 
-        val boxesMat = MatOfRect2d(*boundingBoxes.toTypedArray())
-        val confidencesMat = MatOfFloat(*confidences.toFloatArray())
+        val boxesMat = MatOfRect2d(*personBoxes.toTypedArray())
+        val confidencesMat = MatOfFloat(*personConfidences.toFloatArray())
         val indicesMat = MatOfInt()
 
         try {
@@ -231,44 +230,40 @@ class YoloDetector(
             return emptyList()
         }
 
+        val finalDetections = mutableListOf<Detection>()
         val keepIndices = indicesMat.toArray()
+        Log.d(TAG, "NMS kept ${keepIndices.size} person detections.")
+
         for (index in keepIndices) {
-            if (index < 0 || index >= boundingBoxes.size) {
+            if (index < 0 || index >= personBoxes.size) {
+                Log.w(TAG, "NMS returned invalid index: $index (size: ${personBoxes.size})")
                 continue
             }
-            val rect = boundingBoxes[index]
-            val classIdx = classIndexes[index]
-            val className = if (classIdx >= 0 && classIdx < NUM_CLASSES) {
-                if (classIdx < cocoLabels.size) {
-                    cocoLabels[classIdx]
-                } else {
-                    "Unknown ($classIdx)"
-                }
-            } else {
-                "Unknown ($classIdx)"
-            }
+            val rect = personBoxes[index]
+            val confidence = personConfidences[index]
+            val className = cocoLabels[PERSON_CLASS_INDEX]
 
             val detection = Detection(
                 Rect(rect.x.toInt(), rect.y.toInt(), rect.width.toInt(), rect.height.toInt()),
-                confidences[index],
-                classIdx,
+                confidence,
+                PERSON_CLASS_INDEX,
                 className
             )
-            detections.add(detection)
+            finalDetections.add(detection)
         }
 
         boxesMat.release()
         confidencesMat.release()
         indicesMat.release()
 
-        return detections
+        return finalDetections
     }
 
     fun close() {
         tfliteInterpreter?.close()
         tfliteInterpreter = null
         isInitialized.set(false)
-        Log.d(TAG, "YoloDetector closed.")
+        Log.d(TAG, "YoloDetector closed (standalone).")
     }
 }
 

@@ -2,7 +2,7 @@ pluginManagement {
     repositories {
         google()
         mavenCentral()
-        gradlePluginPortal()
+        gradlePluginPortal() // Make sure this line is present
     }
 }
 
@@ -11,10 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven { url 'https://jitpack.io' }
     }
 }
 
 rootProject.name = "DiskTrack3"
 include ':app'
-// include ':opencv' // Remove this if you are no longer using the local opencv module

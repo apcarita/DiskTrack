@@ -1,19 +1,3 @@
-   implementation 'com.google.android.gms:play-services-tflite-java:16.1.0'
-    implementation 'com.google.android.gms:play-services-tflite-support:16.1.0'
-    implementation 'com.google.android.gms:play-services-tflite-gpu:16.2.0'
-
-
-    // LiteRT dependencies for Google Play services - Use specific doc versions
-  //  implementation 'com.google.android.gms:play-services-tflite-java:16.1.0' // Base Java API (as per doc step 1)
-    //implementation 'com.google.android.gms:play-services-tflite-support:16.1.0'
-
-    //implementation 'com.google.android.gms:play-services-tflite-gpu:16.2.0'  // GPU Delegate support (as per doc GPU section)
-
-    // Optional: include LiteRT Support Library (Uncomment if needed later, ensure version matches)
-    // implementation 'com.google.android.gms:play-services-tflite-support:16.1.0' // Match java version if used
-
-
-
 package com.example.disktrack3
 
 import android.content.Context
@@ -48,11 +32,11 @@ class YoloDetector(
     options: InterpreterApi.Options
 ) {
 
-    private val TAG = "YoloDetector_CPU"
-    private val TFLITE_MODEL_FILE = "yolo11n.tflite"
-    private val YOLO_INPUT_SIZE = 640
-    private val YOLO_CONFIDENCE_THRESHOLD = 0.25f
-    private val YOLO_IOU_THRESHOLD = 0.45f
+    private val TAG = "YoloDetector"
+    private val TFLITE_MODEL_FILE = "yolo11n.tflite" // Your model file in assets
+    private val YOLO_INPUT_SIZE = 640 // Input size expected by your YOLO model
+    private val YOLO_CONFIDENCE_THRESHOLD = 0.25f // Restore a reasonable threshold
+    private val YOLO_IOU_THRESHOLD = 0.45f // Threshold for Non-Max Suppression
 
     private var tfliteInterpreter: InterpreterApi? = null
     private val isInitialized = AtomicBoolean(false)
@@ -73,40 +57,35 @@ class YoloDetector(
         "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
     )
     private val ACTUAL_EXPECTED_NUM_CLASSES = 80
-    private val OUTPUT_NUM_PARAMS = 84
+    private val OUTPUT_NUM_PARAMS = 84 // 4 (bbox) + 80 (classes)
     private val OUTPUT_NUM_PREDICTIONS = 8400
 
     init {
         try {
-            Log.w(TAG, "INIT: Starting YoloDetector (CPU) initialization...")
             val assetManager = context.assets
-            Log.i(TAG, "INIT: Loading model file: $TFLITE_MODEL_FILE")
             val modelBuffer = loadModelFile(assetManager, TFLITE_MODEL_FILE)
-            Log.i(TAG, "INIT: Model file loaded.")
 
-            Log.w(TAG, "INIT: Creating TFLite InterpreterApi with provided options...")
-            tfliteInterpreter = InterpreterApi.create(modelBuffer, options)
-            Log.w(TAG, "INIT: TFLite InterpreterApi created.")
+            // Initialize InterpreterApi using the provided options and factory method
+            tfliteInterpreter = InterpreterApi.create(modelBuffer, options) // Use factory method
 
             val bufferSize = 1 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3 * 4
-            Log.i(TAG, "INIT: Allocating input buffer size: $bufferSize bytes")
+            Log.d(TAG, "Allocating input buffer size: $bufferSize bytes for ${YOLO_INPUT_SIZE}x${YOLO_INPUT_SIZE}")
             inputByteBuffer = ByteBuffer.allocateDirect(bufferSize)
             inputByteBuffer?.order(ByteOrder.nativeOrder())
-            Log.i(TAG, "INIT: Input buffer allocated.")
 
             val outputTensor = tfliteInterpreter?.getOutputTensor(0)
+
             val reportedOutputShape = outputTensor?.shape() ?: intArrayOf(0, 0, 0)
             val outputDataType = outputTensor?.dataType() ?: DataType.FLOAT32
-            Log.i(TAG, "INIT: Output Shape: ${reportedOutputShape.joinToString()}, DataType: $outputDataType")
+            Log.d(TAG, "TFLite Reported Output Shape: ${reportedOutputShape.joinToString()}, DataType: $outputDataType")
 
             val BATCH_SIZE = 1
-            Log.i(TAG, "INIT: Allocating output buffer...")
+            Log.d(TAG, "Allocating output buffer with shape: [$BATCH_SIZE, $OUTPUT_NUM_PARAMS, $OUTPUT_NUM_PREDICTIONS]")
             outputBuffer = Array(BATCH_SIZE) { Array(OUTPUT_NUM_PARAMS) { FloatArray(OUTPUT_NUM_PREDICTIONS) } }
-            Log.i(TAG, "INIT: Output buffer allocated.")
 
             val NUM_PARAMS = OUTPUT_NUM_PARAMS
             val NUM_CLASSES = NUM_PARAMS - 4
-            Log.i(TAG, "INIT: Using Num Classes: $NUM_CLASSES")
+            Log.d(TAG, "Using FIXED Num Classes: $NUM_CLASSES")
             if (NUM_CLASSES != ACTUAL_EXPECTED_NUM_CLASSES) {
                 Log.e(TAG, "FIXED class count ($NUM_CLASSES) does not match expected COCO count ($ACTUAL_EXPECTED_NUM_CLASSES). Check NUM_PARAMS.")
             }
@@ -116,14 +95,12 @@ class YoloDetector(
 
             classNames = cocoLabels
 
-            Log.w(TAG, "INIT: About to set isInitialized to true.")
             isInitialized.set(true)
-            Log.w(TAG, "INIT: YoloDetector (CPU) initialized SUCCESSFULLY.")
+            Log.d(TAG, "YoloDetector initialized successfully")
         } catch (e: Exception) {
-            Log.e(TAG, "Error initializing YoloDetector (CPU): ${e.message}", e)
+            Log.e(TAG, "Error initializing YoloDetector: ${e.message}", e)
+            // InterpreterApi handles delegate closure internally on error or close()
             isInitialized.set(false)
-            tfliteInterpreter?.close()
-            tfliteInterpreter = null
         }
     }
 
@@ -189,6 +166,8 @@ class YoloDetector(
         val classIndexes = mutableListOf<Int>()
 
         for (i in 0 until NUM_PREDICTIONS) {
+            var currentMaxClassScore = 0f
+
             val centerX = output[0][0][i]
             val centerY = output[0][1][i]
             val width = output[0][2][i]
@@ -198,13 +177,16 @@ class YoloDetector(
             var classIndex = -1
             for (j in 0 until NUM_CLASSES) {
                 val classScore = output[0][4 + j][i]
-                if (classScore > maxClassScore) {
-                    maxClassScore = classScore
+                if (classScore > currentMaxClassScore) {
+                    currentMaxClassScore = classScore
                     classIndex = j
                 }
             }
+            maxClassScore = currentMaxClassScore
 
-            if (maxClassScore >= YOLO_CONFIDENCE_THRESHOLD) {
+            val finalConfidence = maxClassScore
+
+            if (finalConfidence >= YOLO_CONFIDENCE_THRESHOLD) {
                 if (classIndex != -1) {
                     val scaleX = frameWidth.toDouble() / YOLO_INPUT_SIZE
                     val scaleY = frameHeight.toDouble() / YOLO_INPUT_SIZE
@@ -224,7 +206,7 @@ class YoloDetector(
 
                     if (rectWidth > 0 && rectHeight > 0) {
                         boundingBoxes.add(Rect2d(x1, y1, rectWidth, rectHeight))
-                        confidences.add(maxClassScore)
+                        confidences.add(finalConfidence)
                         classIndexes.add(classIndex)
                     }
                 }
@@ -256,8 +238,12 @@ class YoloDetector(
             }
             val rect = boundingBoxes[index]
             val classIdx = classIndexes[index]
-            val className = if (classIdx >= 0 && classIdx < classNames.size) {
-                classNames[classIdx]
+            val className = if (classIdx >= 0 && classIdx < NUM_CLASSES) {
+                if (classIdx < cocoLabels.size) {
+                    cocoLabels[classIdx]
+                } else {
+                    "Unknown ($classIdx)"
+                }
             } else {
                 "Unknown ($classIdx)"
             }
@@ -279,10 +265,8 @@ class YoloDetector(
     }
 
     fun close() {
-        Log.d(TAG, "Closing YoloDetector (CPU)...")
         tfliteInterpreter?.close()
         tfliteInterpreter = null
         isInitialized.set(false)
-        Log.d(TAG, "YoloDetector (CPU) closed.")
+        Log.d(TAG, "YoloDetector closed.")
     }
-}
