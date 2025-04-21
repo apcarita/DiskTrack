@@ -41,6 +41,7 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
 
     // --- YOLO Detection ---
     @Volatile private var yoloDetector: YoloDetector? = null // Make nullable and volatile for async init
+    private val YOLO_CPU_THREADS = 4 // Define number of threads for CPU inference
     // --- End YOLO Detection ---
 
     // --- Canny Edge Processing ---
@@ -161,16 +162,17 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
         try {
             backgroundExecutor.submit {
                 Log.d(TAG, "BACKGROUND_TASK: Task submitted to executor has STARTED (createYoloDetector).")
-                Log.w(TAG, "BACKGROUND_TASK: Attempting to create YoloDetector (CPU via Play Services)...")
+                Log.w(TAG, "BACKGROUND_TASK: Attempting to create YoloDetector (CPU via Play Services with $YOLO_CPU_THREADS threads)...")
                 try {
                     // Create options for CPU execution using Play Services Runtime
                     val options = InterpreterApi.Options()
                         .setRuntime(TfLiteRuntime.FROM_SYSTEM_ONLY) // Use Play Services
+                        .setNumThreads(YOLO_CPU_THREADS) // Set the number of CPU threads
 
-                    Log.i(TAG, "BACKGROUND_TASK: Interpreter options created (CPU only).")
+                    Log.i(TAG, "BACKGROUND_TASK: Interpreter options created (CPU, $YOLO_CPU_THREADS threads).")
 
                     // Initialize the detector with CPU options
-                    yoloDetector = YoloDetector(this, options) // Pass context and CPU options
+                    yoloDetector = YoloDetector(this, options) // Pass context and configured options
                     Log.w(TAG, "BACKGROUND_TASK: YoloDetector (CPU) created. Ready: ${yoloDetector?.isReady()}")
 
                 } catch (e: Exception) {
@@ -289,27 +291,27 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
     override fun onCameraFrame(inputFrame: CameraBridgeViewBase.CvCameraViewFrame): Mat {
         // Get the original frame
         val currentFrame = inputFrame.rgba() // RGBA format from camera
+        var displayFrame = currentFrame // Frame to display, might be modified
 
         try {
             // Process frame based on selected mode
             when (processingMode) {
                 0 -> { // Normal
-                    return currentFrame
+                    // No processing needed
                 }
                 1 -> { // Grayscale
                     val grayFrame = Mat()
                     Imgproc.cvtColor(currentFrame, grayFrame, Imgproc.COLOR_RGBA2GRAY)
                     Imgproc.cvtColor(grayFrame, grayFrame, Imgproc.COLOR_GRAY2RGBA) // Convert back for display
-                    return grayFrame
+                    displayFrame = grayFrame // Update display frame
                 }
                 2 -> { // Canny Edge Detection (Refactored)
-                    val edgesResult = cannyEdgeProcessor.processFrame(currentFrame)
-                    return edgesResult
+                    displayFrame = cannyEdgeProcessor.processFrame(currentFrame) // Update display frame
                 }
                 3 -> { // Color Inversion
                     val invertedFrame = Mat()
                     Core.bitwise_not(currentFrame, invertedFrame)
-                    return invertedFrame
+                    displayFrame = invertedFrame // Update display frame
                 }
                 4 -> { // YOLO Object Detection (Background Thread)
                     Log.d(TAG, "onCameraFrame: Mode 4 (YOLO). Detector null? ${yoloDetector == null}. Ready? ${yoloDetector?.isReady()}. Processing? ${isProcessingFrame.get()}")
@@ -319,7 +321,7 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
                         Log.d(TAG, "onCameraFrame: Conditions met, attempting to submit frame.")
                         if (isProcessingFrame.compareAndSet(false, true)) {
                             Log.d(TAG, "Submitting frame for YOLO processing")
-                            val frameCopy = currentFrame.clone()
+                            val frameCopy = currentFrame.clone() // Clone the frame for background processing
 
                             backgroundExecutor.submit {
                                 try {
@@ -327,13 +329,11 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
                                     val frameWidth = frameCopy.cols()
                                     val frameHeight = frameCopy.rows()
 
-                                    // Convert Mat to Bitmap
-                                    val bitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
-                                    Utils.matToBitmap(frameCopy, bitmap)
-
-                                    // Run Detection
-                                    val detections = currentDetector.detect(bitmap, frameWidth, frameHeight)
+                                    // --- Run Detection directly on the Mat ---
+                                    // No Bitmap conversion needed here
+                                    val detections = currentDetector.detect(frameCopy, frameWidth, frameHeight) // Pass Mat directly
                                     latestDetections.set(detections)
+                                    // --- End Detection ---
 
                                     // --- Calculate YOLO FPS ---
                                     yoloFrameCount++
@@ -343,74 +343,98 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
                                         currentYoloFps = yoloFrameCount * 1000.0 / elapsed
                                         lastYoloFpsTime = now
                                         yoloFrameCount = 0
+                                        // Update FPS on UI thread inside the interval check
+                                        runOnUiThread {
+                                            yoloFpsTextView.text = String.format(java.util.Locale.US, "YOLO FPS: %.2f", currentYoloFps)
+                                            yoloFpsTextView.visibility = View.VISIBLE
+                                        }
                                     }
                                     // --- End YOLO FPS Calculation ---
 
                                     val endTime = System.currentTimeMillis()
                                     Log.d(TAG, "Background Detection Time: ${endTime - startTime} ms, Found: ${detections.size}")
 
-                                    bitmap.recycle()
+                                    // No bitmap to recycle
 
                                 } catch (e: Exception) {
                                     Log.e(TAG, "Error in background YOLO processing: ${e.message}", e)
                                     latestDetections.set(emptyList())
                                 } finally {
-                                    frameCopy.release()
+                                    frameCopy.release() // Release the cloned Mat
                                     isProcessingFrame.set(false)
                                     Log.d(TAG, "Background processing finished.")
                                 }
                             }
+                        } else {
+                             Log.d(TAG, "Skipping frame submission: Already processing or detector not ready.")
                         }
+                    } else {
+                         Log.d(TAG, "Skipping frame submission: Detector not ready or null.")
                     }
 
-                    // --- Draw Latest Results ---
+                    // --- Draw Latest Results on the original frame ---
                     val detectionsToDraw = latestDetections.get()
                     if (detectionsToDraw.isNotEmpty()) {
                         for (det in detectionsToDraw) {
-                            Imgproc.rectangle(currentFrame, det.boundingBox, rectColor, 2)
+                            Imgproc.rectangle(displayFrame, det.boundingBox, rectColor, 2) // Draw on displayFrame
                             val label = "${det.className} ${String.format("%.2f", det.confidence)}"
                             Imgproc.putText(
-                                currentFrame, label, Point(det.boundingBox.x.toDouble(), det.boundingBox.y.toDouble() - 10),
+                                displayFrame, label, Point(det.boundingBox.x.toDouble(), det.boundingBox.y.toDouble() - 10),
                                 Imgproc.FONT_HERSHEY_SIMPLEX, 0.6, textColor, 2
                             )
                         }
                         Imgproc.putText(
-                            currentFrame,
+                            displayFrame,
                             "Drawn: ${detectionsToDraw.size} (Prev)",
                             Point(10.0, 30.0),
                             Imgproc.FONT_HERSHEY_SIMPLEX, 0.7, infoColor, 2
                         )
                     } else if (yoloDetector == null) { // Check if null due to async init
                         Imgproc.putText(
-                            currentFrame, "Initializing Detector...", Point(10.0, 30.0),
+                            displayFrame, "Initializing Detector...", Point(10.0, 30.0),
                             Imgproc.FONT_HERSHEY_SIMPLEX, 0.7, textColor, 2
                         )
                     } else if (isProcessingFrame.get()) {
                         Imgproc.putText(
-                            currentFrame, "Processing...", Point(10.0, 30.0),
+                            displayFrame, "Processing...", Point(10.0, 30.0),
+                            Imgproc.FONT_HERSHEY_SIMPLEX, 0.7, infoColor, 2
+                        )
+                    } else {
+                         // Optionally add text if no detections and not processing
+                         Imgproc.putText(
+                            displayFrame, "No detections", Point(10.0, 30.0),
                             Imgproc.FONT_HERSHEY_SIMPLEX, 0.7, infoColor, 2
                         )
                     }
 
-                    // Update YOLO FPS TextView on UI thread
+                    // Ensure YOLO FPS TextView is visible only in mode 4
                     runOnUiThread {
-                        yoloFpsTextView.text = String.format(java.util.Locale.US, "YOLO FPS: %.2f", currentYoloFps)
-                        yoloFpsTextView.visibility = View.VISIBLE // Make sure it's visible
+                        yoloFpsTextView.visibility = View.VISIBLE
                     }
-
-                    return currentFrame
                 }
                 else -> {
-                    return currentFrame
+                    // No processing needed for other modes
                 }
             }
+
+            // Hide YOLO FPS TextView if not in YOLO mode (outside the when block)
+            if (processingMode != 4) {
+                 runOnUiThread {
+                     yoloFpsTextView.visibility = View.GONE
+                 }
+            }
+
         } catch (e: Exception) {
-            // Hide YOLO FPS if not in YOLO mode or error occurs
+            Log.e(TAG, "Error in frame processing: ${e.message}", e)
+            // Hide YOLO FPS on error
             runOnUiThread {
                 yoloFpsTextView.visibility = View.GONE
             }
-            Log.e(TAG, "Error in frame processing: ${e.message}", e)
+            // Return original frame on error to prevent crash
             return currentFrame
         }
+
+        // Return the potentially modified frame for display
+        return displayFrame
     }
 }

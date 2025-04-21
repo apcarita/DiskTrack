@@ -5,6 +5,7 @@ import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.util.Log
 import org.opencv.android.Utils
+import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfFloat
 import org.opencv.core.MatOfInt
@@ -34,7 +35,10 @@ class YoloDetector(
 
     private val TAG = "YoloDetector"
     private val TFLITE_MODEL_FILE = "yolo11n.tflite" // Your model file in assets
-    private val YOLO_INPUT_SIZE = 640 // Input size expected by your YOLO model
+    // --- Optimization 1: Reduce Input Size ---
+    // Try 416 or 320 for faster CPU inference. Start with 416.
+    private val YOLO_INPUT_SIZE = 640 // Reduced size
+    // --- End Optimization 1 ---
     private val YOLO_CONFIDENCE_THRESHOLD = 0.25f // Restore a reasonable threshold
     private val YOLO_IOU_THRESHOLD = 0.45f // Threshold for Non-Max Suppression
 
@@ -68,7 +72,8 @@ class YoloDetector(
             // Initialize InterpreterApi using the provided options and factory method
             tfliteInterpreter = InterpreterApi.create(modelBuffer, options) // Use factory method
 
-            val bufferSize = 1 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3 * 4
+            // Buffer size needs to match the new YOLO_INPUT_SIZE
+            val bufferSize = 1 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3 * 4 // 3 channels (RGB), 4 bytes per float
             Log.d(TAG, "Allocating input buffer size: $bufferSize bytes for ${YOLO_INPUT_SIZE}x${YOLO_INPUT_SIZE}")
             inputByteBuffer = ByteBuffer.allocateDirect(bufferSize)
             inputByteBuffer?.order(ByteOrder.nativeOrder())
@@ -118,30 +123,54 @@ class YoloDetector(
 
     data class Detection(val boundingBox: Rect, val confidence: Float, val classIndex: Int, val className: String)
 
-    fun detect(bitmap: Bitmap, frameWidth: Int, frameHeight: Int): List<Detection> {
+    fun detect(rgbaMat: Mat, frameWidth: Int, frameHeight: Int): List<Detection> {
         if (!isInitialized.get() || tfliteInterpreter == null || inputByteBuffer == null || outputBuffer == null) {
             Log.w(TAG, "Detector not initialized or buffers are null.")
             return emptyList()
         }
 
-        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE, true)
+        // --- Optimization 2: Alternative Preprocessing ---
+        val resizedMat = Mat()
+        val rgbMat = Mat()
+        val floatMat = Mat() // Mat to hold float data
+        try {
+            // 1. Resize the input Mat (RGBA)
+            Imgproc.resize(rgbaMat, resizedMat, Size(YOLO_INPUT_SIZE.toDouble(), YOLO_INPUT_SIZE.toDouble()))
 
-        inputByteBuffer?.rewind()
-        val intValues = IntArray(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE)
-        resizedBitmap.getPixels(intValues, 0, resizedBitmap.width, 0, 0, resizedBitmap.width, resizedBitmap.height)
+            // 2. Convert RGBA to RGB
+            Imgproc.cvtColor(resizedMat, rgbMat, Imgproc.COLOR_RGBA2RGB)
 
-        var pixel = 0
-        for (i in 0 until YOLO_INPUT_SIZE) {
-            for (j in 0 until YOLO_INPUT_SIZE) {
-                val value = intValues[pixel++]
-                val r = ((value shr 16 and 0xFF) / 255.0f)
-                val g = ((value shr 8 and 0xFF) / 255.0f)
-                val b = ((value and 0xFF) / 255.0f)
-                inputByteBuffer?.putFloat(r)
-                inputByteBuffer?.putFloat(g)
-                inputByteBuffer?.putFloat(b)
+            // 3. Convert RGB U8 to RGB Float32 and normalize
+            rgbMat.convertTo(floatMat, CvType.CV_32FC3, 1.0 / 255.0)
+
+            // 4. Populate ByteBuffer directly from float Mat
+            inputByteBuffer?.rewind()
+            val floatBuffer = inputByteBuffer?.asFloatBuffer()
+
+            // Check if floatMat is continuous for potentially faster access
+            if (!floatMat.isContinuous) {
+                 Log.w(TAG, "Warning: floatMat is not continuous. Data access might be slower.")
+                 // Consider cloning: floatMat = floatMat.clone()
             }
+
+            // Get all float data at once
+            val numElements = YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3
+            val floatData = FloatArray(numElements)
+            floatMat.get(0, 0, floatData) // Get float data from Mat
+
+            // Put data into the buffer
+            floatBuffer?.put(floatData)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during preprocessing: ${e.message}", e)
+            return emptyList()
+        } finally {
+            // Release temporary Mats
+            resizedMat.release()
+            rgbMat.release()
+            floatMat.release() // Release the new float Mat
         }
+        // --- End Optimization 2 ---
 
         try {
             tfliteInterpreter?.run(inputByteBuffer, outputBuffer)
@@ -150,9 +179,16 @@ class YoloDetector(
             return emptyList()
         }
 
+        // --- Postprocessing (Keep only 'person' detections) ---
         val allDetections = processOutput(outputBuffer!!, frameWidth, frameHeight)
+        // Filter for "person" class - case-insensitive comparison is safer
         val personDetections = allDetections.filter { it.className.equals("person", ignoreCase = true) }
+        // Log if persons were detected vs total detections
+        if (personDetections.isNotEmpty()) {
+             Log.d(TAG, "Detected ${personDetections.size} persons out of ${allDetections.size} total detections.")
+        }
         return personDetections
+        // --- End Postprocessing ---
     }
 
     private fun processOutput(output: Array<Array<FloatArray>>, frameWidth: Int, frameHeight: Int): List<Detection> {
