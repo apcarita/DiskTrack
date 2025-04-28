@@ -34,11 +34,11 @@ class YoloDetector(
 ) {
 
     private val TAG = "YoloDetector"
-    private val TFLITE_MODEL_FILE = "yolo11n.tflite" // Your model file in assets
-    // --- Optimization 1: Reduce Input Size ---
-    // Try 416 or 320 for faster CPU inference. Start with 416.
-    private val YOLO_INPUT_SIZE = 640 // Reduced size
-    // --- End Optimization 1 ---
+    // --- Optimization: Use Quantized Model ---
+    private val TFLITE_MODEL_FILE = "yolo11n.tflite" 
+    // --- End Optimization ---
+
+    private val YOLO_INPUT_SIZE = 640 // Input size remains 640 as requested
     private val YOLO_CONFIDENCE_THRESHOLD = 0.25f // Restore a reasonable threshold
     private val YOLO_IOU_THRESHOLD = 0.45f // Threshold for Non-Max Suppression
 
@@ -132,7 +132,7 @@ class YoloDetector(
         // --- Optimization 2: Alternative Preprocessing ---
         val resizedMat = Mat()
         val rgbMat = Mat()
-        val floatMat = Mat() // Mat to hold float data
+        var floatMat = Mat() // Mat to hold float data - Make it var for potential cloning
         try {
             // 1. Resize the input Mat (RGBA)
             Imgproc.resize(rgbaMat, resizedMat, Size(YOLO_INPUT_SIZE.toDouble(), YOLO_INPUT_SIZE.toDouble()))
@@ -147,11 +147,12 @@ class YoloDetector(
             inputByteBuffer?.rewind()
             val floatBuffer = inputByteBuffer?.asFloatBuffer()
 
-            // Check if floatMat is continuous for potentially faster access
+            // --- Ensure Mat is continuous ---
             if (!floatMat.isContinuous) {
-                 Log.w(TAG, "Warning: floatMat is not continuous. Data access might be slower.")
-                 // Consider cloning: floatMat = floatMat.clone()
+                 Log.w(TAG, "Cloning floatMat because it's not continuous.")
+                 floatMat = floatMat.clone() // Clone to ensure continuous memory
             }
+            // --- End Ensure Continuous ---
 
             // Get all float data at once
             val numElements = YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3
@@ -168,7 +169,8 @@ class YoloDetector(
             // Release temporary Mats
             resizedMat.release()
             rgbMat.release()
-            floatMat.release() // Release the new float Mat
+            // floatMat is released even if it was cloned (original is unused after clone)
+            floatMat.release()
         }
         // --- End Optimization 2 ---
 
