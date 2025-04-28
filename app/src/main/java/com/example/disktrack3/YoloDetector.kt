@@ -4,16 +4,12 @@ import android.content.Context
 import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.util.Log
-import org.opencv.android.Utils
-import org.opencv.core.Mat
-import org.opencv.core.MatOfFloat
-import org.opencv.core.MatOfInt
-import org.opencv.core.MatOfRect2d
 import org.opencv.core.Rect
 import org.opencv.core.Rect2d
-import org.opencv.core.Size
 import org.opencv.dnn.Dnn
-import org.opencv.imgproc.Imgproc
+import org.opencv.core.MatOfRect2d
+import org.opencv.core.MatOfFloat
+import org.opencv.core.MatOfInt
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 
@@ -22,29 +18,24 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import java.util.Locale
+import java.util.HashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
 
 class YoloDetector(
-    context: Context,
-    options: Interpreter.Options
+    context: Context
 ) {
 
     private val TAG = "YoloDetector"
-    private val TFLITE_MODEL_FILE = "yolo11n.tflite" // Your model file in assets
-    // *** Optimization Note: Consider reducing input size if model supports it ***
-    // Smaller sizes like 320 or 416 significantly reduce computation.
-    // Check model documentation or try experimentally.
-    private val YOLO_INPUT_SIZE = 640 // Input size expected by your YOLO model
-    private val YOLO_CONFIDENCE_THRESHOLD = 0.25f // Restore a reasonable threshold
-    private val YOLO_IOU_THRESHOLD = 0.45f // Threshold for Non-Max Suppression
+    private val TFLITE_MODEL_FILE = "yolo11n_float16_r416.tflite"
+    private val YOLO_INPUT_SIZE = 416
+    private val YOLO_CONFIDENCE_THRESHOLD = 0.25f
+    private val YOLO_IOU_THRESHOLD = 0.45f
 
     private var tfliteInterpreter: Interpreter? = null
     private val isInitialized = AtomicBoolean(false)
     private var inputByteBuffer: ByteBuffer? = null
-    private var outputBuffer: Array<Array<FloatArray>>? = null
     var classNames: List<String> = listOf()
 
     private val cocoLabels = listOf(
@@ -60,12 +51,12 @@ class YoloDetector(
         "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
     )
     private val ACTUAL_EXPECTED_NUM_CLASSES = 80
-    private val OUTPUT_NUM_PARAMS = 84 // 4 (bbox) + 80 (classes)
-    private val OUTPUT_NUM_PREDICTIONS = 8400
+    private val OUTPUT_NUM_PARAMS = 84
+    private val OUTPUT_NUM_PREDICTIONS = 3549
     private val PERSON_CLASS_INDEX: Int = cocoLabels.indexOf("person")
 
     init {
-        Log.d(TAG, "YoloDetector init: Starting initialization (standalone)...")
+        Log.d(TAG, "YoloDetector init: Starting initialization (CPU focus)...")
         if (PERSON_CLASS_INDEX == -1) {
             Log.e(TAG, "Initialization Error: Could not find 'person' class in cocoLabels!")
         } else {
@@ -76,44 +67,60 @@ class YoloDetector(
             val assetManager = context.assets
             val modelBuffer = loadModelFile(assetManager, TFLITE_MODEL_FILE)
 
-            // Initialize standalone Interpreter directly using LiteRT implementation
-            tfliteInterpreter = Interpreter(modelBuffer, options)
+            val interpreterOptions = Interpreter.Options()
+            val numThreads = 4
+            interpreterOptions.setNumThreads(numThreads)
+            Log.i(TAG, "Setting TFLite CPU threads to: $numThreads")
 
-            val bufferSize = 1 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3 * 4
-            Log.d(TAG, "Allocating input buffer size: $bufferSize bytes for ${YOLO_INPUT_SIZE}x${YOLO_INPUT_SIZE}")
-            inputByteBuffer = ByteBuffer.allocateDirect(bufferSize)
+            tfliteInterpreter = Interpreter(modelBuffer, interpreterOptions)
+
+            // --- Input Buffer Setup (FLOAT32, updated size) ---
+            // Size = Batch * Height * Width * Channels * BytesPerChannel (4 for FLOAT32)
+            val inputBufferSize = 1 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE * 3 * 4 // Use updated YOLO_INPUT_SIZE
+            Log.d(TAG, "Allocating FLOAT32 input buffer size: $inputBufferSize bytes for ${YOLO_INPUT_SIZE}x${YOLO_INPUT_SIZE}") // Log updated size
+            inputByteBuffer = ByteBuffer.allocateDirect(inputBufferSize)
             inputByteBuffer?.order(ByteOrder.nativeOrder())
 
             val outputTensor = tfliteInterpreter?.getOutputTensor(0)
-
             val reportedOutputShape = outputTensor?.shape() ?: intArrayOf(0, 0, 0)
             val outputDataType = outputTensor?.dataType() ?: DataType.FLOAT32
             Log.d(TAG, "TFLite Reported Output Shape: ${reportedOutputShape.joinToString()}, DataType: $outputDataType")
 
-            val BATCH_SIZE = 1
-            Log.d(TAG, "Allocating output buffer with shape: [$BATCH_SIZE, $OUTPUT_NUM_PARAMS, $OUTPUT_NUM_PREDICTIONS]")
-            outputBuffer = Array(BATCH_SIZE) { Array(OUTPUT_NUM_PARAMS) { FloatArray(OUTPUT_NUM_PREDICTIONS) } }
-
-            val NUM_PARAMS = OUTPUT_NUM_PARAMS
-            val NUM_CLASSES = NUM_PARAMS - 4
-            Log.d(TAG, "Using FIXED Num Classes: $NUM_CLASSES")
-            if (NUM_CLASSES != ACTUAL_EXPECTED_NUM_CLASSES) {
-                Log.e(TAG, "FIXED class count ($NUM_CLASSES) does not match expected COCO count ($ACTUAL_EXPECTED_NUM_CLASSES). Check NUM_PARAMS.")
-            }
-            if (cocoLabels.size != ACTUAL_EXPECTED_NUM_CLASSES) {
-                Log.w(TAG, "Mismatch between cocoLabels size (${cocoLabels.size}) and ACTUAL_EXPECTED_NUM_CLASSES ($ACTUAL_EXPECTED_NUM_CLASSES).")
+            if (reportedOutputShape.size != 3 || reportedOutputShape[0] != 1 || reportedOutputShape[1] != OUTPUT_NUM_PARAMS || reportedOutputShape[2] != OUTPUT_NUM_PREDICTIONS) {
+                Log.e(TAG, "FATAL: Output tensor shape ${reportedOutputShape.joinToString()} does NOT match expected [1, $OUTPUT_NUM_PARAMS, $OUTPUT_NUM_PREDICTIONS]. Check model or constants.")
+                isInitialized.set(false)
+            } else if (outputDataType != DataType.FLOAT32) {
+                Log.w(TAG, "Warning: Output tensor data type is $outputDataType, but processing assumes FLOAT32.")
+                isInitialized.set(true)
+            } else {
+                isInitialized.set(true)
             }
 
-            classNames = cocoLabels
+            if (isInitialized.get()) {
+                val NUM_PARAMS = OUTPUT_NUM_PARAMS
+                val NUM_CLASSES = NUM_PARAMS - 4
+                Log.d(TAG, "Using FIXED Num Classes: $NUM_CLASSES")
+                if (NUM_CLASSES != ACTUAL_EXPECTED_NUM_CLASSES) {
+                    Log.e(TAG, "FIXED class count ($NUM_CLASSES) does not match expected COCO count ($ACTUAL_EXPECTED_NUM_CLASSES). Check NUM_PARAMS.")
+                }
+                if (cocoLabels.size != ACTUAL_EXPECTED_NUM_CLASSES) {
+                    Log.w(TAG, "Mismatch between cocoLabels size (${cocoLabels.size}) and ACTUAL_EXPECTED_NUM_CLASSES ($ACTUAL_EXPECTED_NUM_CLASSES).")
+                }
+                classNames = cocoLabels
 
-            isInitialized.set(true)
-            Log.d(TAG, "YoloDetector initialized successfully (standalone)")
+                Log.d(TAG, "YoloDetector initialized successfully (CPU focus, FLOAT32 input, ${YOLO_INPUT_SIZE}x${YOLO_INPUT_SIZE}, ${OUTPUT_NUM_PREDICTIONS} predictions)")
+            } else {
+                tfliteInterpreter?.close()
+                tfliteInterpreter = null
+                Log.e(TAG, "YoloDetector initialization failed due to output shape mismatch.")
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Error initializing YoloDetector (standalone): ${e.message}", e)
-            // Interpreter handles delegate closure internally on error or close()
+            Log.e(TAG, "Error initializing YoloDetector (CPU focus): ${e.message}", e)
+            tfliteInterpreter?.close()
+            tfliteInterpreter = null
             isInitialized.set(false)
         }
-        Log.d(TAG, "YoloDetector init: Initialization block finished (standalone).")
+        Log.d(TAG, "YoloDetector init: Initialization block finished (CPU focus). Final Ready State: ${isInitialized.get()}")
     }
 
     fun isReady(): Boolean = isInitialized.get()
@@ -125,14 +132,18 @@ class YoloDetector(
         val fileChannel = inputStream.channel
         val startOffset = fileDescriptor.startOffset
         val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        val mappedByteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        fileChannel.close()
+        inputStream.close()
+        fileDescriptor.close()
+        return mappedByteBuffer
     }
 
     data class Detection(val boundingBox: Rect, val confidence: Float, val classIndex: Int, val className: String)
 
     fun detect(bitmap: Bitmap, frameWidth: Int, frameHeight: Int): List<Detection> {
-        if (!isInitialized.get() || tfliteInterpreter == null || inputByteBuffer == null || outputBuffer == null) {
-            Log.w(TAG, "Detector not initialized or buffers are null (standalone).")
+        if (!isInitialized.get() || tfliteInterpreter == null || inputByteBuffer == null) {
+            Log.w(TAG, "Detector not initialized or input buffer is null.")
             return emptyList()
         }
 
@@ -142,6 +153,7 @@ class YoloDetector(
         val intValues = IntArray(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE)
         resizedBitmap.getPixels(intValues, 0, resizedBitmap.width, 0, 0, resizedBitmap.width, resizedBitmap.height)
 
+        // --- Populate FLOAT32 ByteBuffer ---
         var pixel = 0
         for (i in 0 until YOLO_INPUT_SIZE) {
             for (j in 0 until YOLO_INPUT_SIZE) {
@@ -154,15 +166,27 @@ class YoloDetector(
                 inputByteBuffer?.putFloat(b)
             }
         }
+        resizedBitmap.recycle()
+
+        val outputs = HashMap<Int, Any>()
+        val BATCH_SIZE = 1
+        val outputArray = Array(BATCH_SIZE) { Array(OUTPUT_NUM_PARAMS) { FloatArray(OUTPUT_NUM_PREDICTIONS) } }
+        outputs[0] = outputArray
 
         try {
-            tfliteInterpreter?.run(inputByteBuffer, outputBuffer)
+            tfliteInterpreter?.runForMultipleInputsOutputs(arrayOf(inputByteBuffer), outputs)
         } catch (e: Exception) {
-            Log.e(TAG, "TFLite inference error (standalone): ${e.message}", e)
+            Log.e(TAG, "TFLite inference error: ${e.message}", e)
             return emptyList()
         }
 
-        return processOutput(outputBuffer!!, frameWidth, frameHeight)
+        val outputData = outputs[0] as? Array<Array<FloatArray>>
+        if (outputData == null) {
+            Log.e(TAG, "Output data retrieval failed or incorrect type.")
+            return emptyList()
+        }
+
+        return processOutput(outputData, frameWidth, frameHeight)
     }
 
     private fun processOutput(output: Array<Array<FloatArray>>, frameWidth: Int, frameHeight: Int): List<Detection> {
@@ -211,10 +235,8 @@ class YoloDetector(
         }
 
         if (personBoxes.isEmpty()) {
-            Log.d(TAG, "No potential person detections found before NMS.")
             return emptyList()
         }
-        Log.d(TAG, "Found ${personBoxes.size} potential person detections before NMS.")
 
         val boxesMat = MatOfRect2d(*personBoxes.toTypedArray())
         val confidencesMat = MatOfFloat(*personConfidences.toFloatArray())
@@ -232,7 +254,6 @@ class YoloDetector(
 
         val finalDetections = mutableListOf<Detection>()
         val keepIndices = indicesMat.toArray()
-        Log.d(TAG, "NMS kept ${keepIndices.size} person detections.")
 
         for (index in keepIndices) {
             if (index < 0 || index >= personBoxes.size) {
@@ -262,8 +283,9 @@ class YoloDetector(
     fun close() {
         tfliteInterpreter?.close()
         tfliteInterpreter = null
+        inputByteBuffer = null
         isInitialized.set(false)
-        Log.d(TAG, "YoloDetector closed (standalone).")
+        Log.d(TAG, "YoloDetector closed.")
     }
 }
 

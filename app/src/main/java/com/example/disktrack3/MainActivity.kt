@@ -20,9 +20,6 @@ import org.opencv.android.Utils
 import org.opencv.core.*
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.CompatibilityList
-import org.tensorflow.lite.gpu.GpuDelegate
-import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -143,71 +140,29 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
     // Separate function to create the detector using standalone LiteRT
     private fun createYoloDetector() {
         backgroundExecutor.submit {
-            Log.d(TAG, "BACKGROUND_TASK: Starting YoloDetector creation...")
+            Log.d(TAG, "BACKGROUND_TASK: Starting YoloDetector creation (CPU focus)...")
             var createdDetector: YoloDetector? = null
-            var nnApiDelegate: NnApiDelegate? = null
-            var nnapiAttempted = false
+            var delegateUsed = "CPU (Default/XNNPACK)" // Assume default CPU
 
-            // --- Try NNAPI First ---
             try {
-                nnapiAttempted = true
-                Log.i(TAG, "Attempting NNAPI delegate initialization.")
-                val nnapiOptions = NnApiDelegate.Options()
-                nnApiDelegate = NnApiDelegate(nnapiOptions)
-                val delegateOptions = Interpreter.Options().addDelegate(nnApiDelegate)
-                Log.d(TAG, "NNAPI delegate created and added to options. Attempting YoloDetector creation...")
+                // Create detector directly, letting it handle options
+                createdDetector = YoloDetector(applicationContext)
 
-                createdDetector = YoloDetector(applicationContext, delegateOptions)
-
-                // *** Explicit Check ***
                 if (createdDetector.isReady()) {
-                    Log.i(TAG, "YoloDetector created successfully WITH NNAPI delegate.")
+                    Log.i(TAG, "YoloDetector created successfully with default CPU options.")
                 } else {
-                    Log.w(TAG, "YoloDetector constructor finished but isReady() is false. NNAPI init likely failed internally.")
-                    nnApiDelegate?.close()
-                    nnApiDelegate = null
-                    createdDetector = null
+                    Log.e(TAG, "YoloDetector failed to initialize even with default CPU.")
+                    createdDetector = null // Ensure detector is null
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Exception during NNAPI path setup or YoloDetector instantiation: ${e.message}", e)
-                nnApiDelegate?.close()
-                nnApiDelegate = null
-                createdDetector = null
-            } finally {
-                if (createdDetector == null && nnApiDelegate != null) {
-                    Log.d(TAG, "Closing NNAPI delegate in finally block due to failure.")
-                    nnApiDelegate.close()
-                    nnApiDelegate = null
-                }
+                Log.e(TAG, "Exception creating YoloDetector with default CPU options", e)
+                createdDetector = null // Ensure detector is null
             }
 
-            // --- Fallback to CPU if NNAPI failed or wasn't ready ---
-            if (createdDetector == null) {
-                if (nnapiAttempted) {
-                    Log.w(TAG, "NNAPI initialization failed or detector not ready. Attempting CPU fallback...")
-                } else {
-                    Log.i(TAG, "NNAPI not attempted. Attempting CPU-only Interpreter creation...")
-                }
-                try {
-                    // Use available processors, ensuring at least 1 thread
-                    val numThreads = 4
-                    Log.i(TAG, "Setting CPU fallback threads to: $numThreads")
-                    val cpuOptions = Interpreter.Options().setNumThreads(numThreads)
-                    createdDetector = YoloDetector(applicationContext, cpuOptions)
-                    if (createdDetector.isReady()) {
-                        Log.i(TAG, "YoloDetector created successfully with CPU.")
-                    } else {
-                        Log.e(TAG, "YoloDetector failed to initialize even with CPU.")
-                        createdDetector = null
-                    }
-                } catch (e2: Exception) {
-                    Log.e(TAG, "Exception creating YoloDetector with CPU fallback", e2)
-                    createdDetector = null
-                }
-            }
-
+            // Assign the successfully created detector (or null if all failed)
             yoloDetector = createdDetector
-            Log.d(TAG, "BACKGROUND_TASK: YoloDetector creation finished. Final Ready State: ${yoloDetector?.isReady() ?: false}")
+
+            Log.d(TAG, "BACKGROUND_TASK: YoloDetector creation finished. Delegate Used: $delegateUsed. Final Ready State: ${yoloDetector?.isReady() ?: false}")
         }
     }
 
@@ -287,8 +242,9 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
         backgroundExecutor.shutdown()
         try {
             Log.d(TAG, "onDestroy: Awaiting background executor termination...")
-            if (!backgroundExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
-                Log.w(TAG, "onDestroy: Background executor did not terminate in 5 seconds.")
+            if (!backgroundExecutor.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                Log.w(TAG, "onDestroy: Background executor did not terminate in 3 seconds.")
+                backgroundExecutor.shutdownNow()
             } else {
                 Log.d(TAG, "onDestroy: Background executor terminated gracefully.")
             }
@@ -314,6 +270,7 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
 
     override fun onCameraFrame(inputFrame: CameraBridgeViewBase.CvCameraViewFrame): Mat {
         val currentFrame = inputFrame.rgba()
+        var hideFps = true
 
         try {
             when (processingMode) {
@@ -336,25 +293,24 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
                     return invertedFrame
                 }
                 4 -> {
-                    Log.d(TAG, "onCameraFrame: Mode 4 (YOLO). Detector null? ${yoloDetector == null}. Ready? ${yoloDetector?.isReady()}. Processing? ${isProcessingFrame.get()}")
+                    hideFps = false
                     if (yoloDetector == null) {
-                        Log.w(TAG, "onCameraFrame: yoloDetector is still null. It may be initializing or failed to initialize.")
+                        Log.w(TAG, "onCameraFrame: yoloDetector is still null.")
                     }
 
                     val currentDetector = yoloDetector
                     if (currentDetector != null && currentDetector.isReady() && !isProcessingFrame.get()) {
-                        Log.d(TAG, "onCameraFrame: Conditions met, attempting to submit frame.")
                         if (isProcessingFrame.compareAndSet(false, true)) {
-                            Log.d(TAG, "Submitting frame for YOLO processing")
                             val frameCopy = currentFrame.clone()
 
                             backgroundExecutor.submit {
+                                var bitmap: Bitmap? = null
                                 try {
                                     val startTime = System.currentTimeMillis()
                                     val frameWidth = frameCopy.cols()
                                     val frameHeight = frameCopy.rows()
 
-                                    val bitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
+                                    bitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
                                     Utils.matToBitmap(frameCopy, bitmap)
 
                                     val detections = currentDetector.detect(bitmap, frameWidth, frameHeight)
@@ -367,20 +323,21 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
                                         currentYoloFps = yoloFrameCount * 1000.0 / elapsed
                                         lastYoloFpsTime = now
                                         yoloFrameCount = 0
+                                        runOnUiThread {
+                                            yoloFpsTextView.text = String.format(java.util.Locale.US, "YOLO FPS: %.2f", currentYoloFps)
+                                        }
                                     }
 
                                     val endTime = System.currentTimeMillis()
                                     Log.d(TAG, "Background Detection Time: ${endTime - startTime} ms, Found: ${detections.size}")
 
-                                    bitmap.recycle()
-
                                 } catch (e: Exception) {
                                     Log.e(TAG, "Error in background YOLO processing: ${e.message}", e)
                                     latestDetections.set(emptyList())
                                 } finally {
+                                    bitmap?.recycle()
                                     frameCopy.release()
                                     isProcessingFrame.set(false)
-                                    Log.d(TAG, "Background processing finished.")
                                 }
                             }
                         }
@@ -414,11 +371,6 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
                         )
                     }
 
-                    runOnUiThread {
-                        yoloFpsTextView.text = String.format(java.util.Locale.US, "YOLO FPS: %.2f", currentYoloFps)
-                        yoloFpsTextView.visibility = View.VISIBLE
-                    }
-
                     return currentFrame
                 }
                 else -> {
@@ -426,11 +378,13 @@ class MainActivity : ComponentActivity(), CameraBridgeViewBase.CvCameraViewListe
                 }
             }
         } catch (e: Exception) {
-            runOnUiThread {
-                yoloFpsTextView.visibility = View.GONE
-            }
             Log.e(TAG, "Error in frame processing: ${e.message}", e)
+            hideFps = true
             return currentFrame
+        } finally {
+            runOnUiThread {
+                yoloFpsTextView.visibility = if (hideFps) View.GONE else View.VISIBLE
+            }
         }
     }
 }
